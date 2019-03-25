@@ -8,7 +8,7 @@ from typing import Dict
 import gevent
 import gevent.pool
 import structlog
-from eth_utils import encode_hex, to_checksum_address
+from eth_utils import encode_hex, to_checksum_address, to_hex
 from flask import Flask, make_response, request, send_from_directory, url_for
 from flask.json import jsonify
 from flask_cors import CORS
@@ -44,11 +44,14 @@ from raiden.api.v1.resources import (
     PartnersResourceByTokenAddress,
     PaymentResource,
     PaymentResourceV2,
+    PendingTransfersResource,
+    PendingTransfersResourceByTokenAddress,
+    PendingTransfersResourceByTokenAndPartnerAddress,
     RaidenInternalEventsResource,
     RegisterTokenResource,
     TokensResource,
     create_blueprint,
-)
+    NetworkResource)
 from raiden.constants import GENESIS_BLOCK_NUMBER, Environment
 from raiden.exceptions import (
     AddressWithoutCode,
@@ -64,13 +67,14 @@ from raiden.exceptions import (
     InvalidAmount,
     InvalidBlockNumberInput,
     InvalidNumberInput,
+    InvalidSecretOrSecretHash,
     InvalidSettleTimeout,
     PaymentConflict,
     SamePeerAddress,
     TokenNotRegistered,
     TransactionThrew,
     UnknownTokenAddress,
-)
+    RaidenRecoverableError)
 from raiden.transfer import channel, views
 from raiden.transfer.events import (
     EventPaymentReceivedSuccess,
@@ -98,6 +102,7 @@ ERROR_STATUS_CODES = [
     HTTPStatus.NOT_IMPLEMENTED,
     HTTPStatus.INTERNAL_SERVER_ERROR,
 ]
+
 
 URLS_V1 = [
     (
@@ -169,6 +174,21 @@ URLS_V1 = [
         '/tokens/<hexaddress:token_address>',
         RegisterTokenResource,
     ),
+    (
+        '/pending_transfers',
+        PendingTransfersResource,
+        'pending_transfers_resource',
+    ),
+    (
+        '/pending_transfers/<hexaddress:token_address>',
+        PendingTransfersResourceByTokenAddress,
+        'pending_transfers_resource_by_token',
+    ),
+    (
+        '/pending_transfers/<hexaddress:token_address>/<hexaddress:partner_address>',
+        PendingTransfersResourceByTokenAndPartnerAddress,
+        'pending_transfers_resource_by_token_and_partner',
+    ),
 
     (
         '/_debug/blockchain_events/network',
@@ -194,6 +214,11 @@ URLS_V1 = [
         '/_debug/raiden_events',
         RaidenInternalEventsResource,
     ),
+    (
+        '/network_graph/<hexaddress:token_network_address>',
+        NetworkResource,
+        'network graph by token network',
+    ),
 ]
 
 
@@ -204,6 +229,7 @@ def api_response(result, status_code=HTTPStatus.OK):
     else:
         data = json.dumps(result)
 
+    log.debug('Request successful', response=result, status_code=status_code)
     response = make_response((
         data,
         status_code,
@@ -214,6 +240,7 @@ def api_response(result, status_code=HTTPStatus.OK):
 
 def api_error(errors, status_code):
     assert status_code in ERROR_STATUS_CODES, 'Programming error, unexpected error status code'
+    log.error('Error processing request', errors=errors, status_code=status_code)
     response = make_response((
         json.dumps(dict(errors=errors)),
         status_code,
@@ -824,6 +851,28 @@ class RestAPI:
         result = self.address_list_schema.dump(tokens_list)
         return api_response(result=result.data)
 
+    def get_token_network_for_token(
+            self,
+            registry_address: typing.PaymentNetworkID,
+            token_address: typing.TokenAddress,
+    ):
+        log.debug(
+            'Getting token network for token',
+            node=pex(self.raiden_api.address),
+            token_address=to_checksum_address(token_address),
+        )
+        token_network_address = self.raiden_api.get_token_network_address_for_token_address(
+            registry_address=registry_address,
+            token_address=token_address,
+        )
+
+        if token_network_address is not None:
+            return api_response(result=to_checksum_address(token_network_address))
+        else:
+            pretty_address = to_checksum_address(token_address)
+            message = f'No token network registered for token "{pretty_address}"'
+            return api_error(message, status_code=HTTPStatus.NOT_FOUND)
+
     def get_blockchain_events_network(
             self,
             registry_address: typing.PaymentNetworkID,
@@ -1084,6 +1133,8 @@ class RestAPI:
             target_address: typing.Address,
             amount: typing.TokenAmount,
             identifier: typing.PaymentID,
+            secret: typing.Secret,
+            secret_hash: typing.SecretHash,
     ):
         log.debug(
             'Initiating payment',
@@ -1093,20 +1144,30 @@ class RestAPI:
             target_address=to_checksum_address(target_address),
             amount=amount,
             payment_identifier=identifier,
+            secret=secret,
+            secret_hash=secret_hash,
         )
 
         if identifier is None:
             identifier = create_default_identifier()
 
         try:
-            transfer_result = self.raiden_api.transfer(
+            payment_status = self.raiden_api.transfer(
                 registry_address=registry_address,
                 token_address=token_address,
                 target=target_address,
                 amount=amount,
                 identifier=identifier,
+                secret=secret,
+                secret_hash=secret_hash,
             )
-        except (InvalidAmount, InvalidAddress, PaymentConflict, UnknownTokenAddress) as e:
+        except (
+                InvalidAmount,
+                InvalidAddress,
+                InvalidSecretOrSecretHash,
+                PaymentConflict,
+                UnknownTokenAddress,
+        ) as e:
             return api_error(
                 errors=str(e),
                 status_code=HTTPStatus.CONFLICT,
@@ -1117,7 +1178,7 @@ class RestAPI:
                 status_code=HTTPStatus.PAYMENT_REQUIRED,
             )
 
-        if transfer_result is False:
+        if payment_status.payment_done.get() is False:
             return api_error(
                 errors="Payment couldn't be completed "
                 "(insufficient funds, no route to target or target offline).",
@@ -1131,8 +1192,8 @@ class RestAPI:
             'target_address': target_address,
             'amount': amount,
             'identifier': identifier,
-            'secret': transfer_result.get('secret').hex(),
-            'secret_hash': transfer_result.get('secret_hash').hex(),
+            'secret': to_hex(payment_status.secret),
+            'secret_hash': to_hex(payment_status.secret_hash),
         }
         result = self.payment_schema.dump(payment)
         return api_response(result=result.data)
@@ -1179,6 +1240,7 @@ class RestAPI:
                 errors=str(e),
                 status_code=HTTPStatus.CONFLICT,
             )
+
 
         updated_channel_state = self.raiden_api.get_channel(
             registry_address,
@@ -1296,3 +1358,32 @@ class RestAPI:
                 status_code=HTTPStatus.BAD_REQUEST,
             )
         return result
+
+    def get_pending_transfers(self, token_address=None, partner_address=None):
+        try:
+            return api_response(self.raiden_api.get_pending_transfers(
+                token_address=token_address,
+                partner_address=partner_address,
+            ))
+        except (ChannelNotFound, UnknownTokenAddress) as e:
+            return api_error(errors=str(e), status_code=HTTPStatus.NOT_FOUND)
+
+    def get_network_graph(self, token_network_address=None):
+        if token_network_address is None:
+            return api_error(
+                errors="Token network address must not be empty.",
+                status_code=HTTPStatus.BAD_REQUESTCONFLICT,
+            )
+
+        network_graph = self.raiden_api.get_network_graph(token_network_address)
+
+        if network_graph is None:
+            return api_error(
+                errors="Internal server error getting network_graph.",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        return api_response(result=network_graph.to_dict())
+
+
+
+

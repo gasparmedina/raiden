@@ -1,14 +1,15 @@
+import gevent
 import pytest
 
 from raiden.messages import Ping
-from raiden.settings import DEFAULT_NUMBER_OF_BLOCK_CONFIRMATIONS
-from raiden.tests.utils.events import search_for_item
 from raiden.transfer import state, views
-from raiden.transfer.state_change import Block
 
 
 @pytest.mark.parametrize('number_of_nodes', [2])
-def test_udp_ping_pong(raiden_network, skip_if_not_udp):
+def test_udp_reachable_node(raiden_network, skip_if_not_udp):
+    """A node that answers the ping message must have its state set to
+    reachable.
+    """
     app0, app1 = raiden_network
 
     ping_message = Ping(nonce=0, current_protocol_version=0)
@@ -31,7 +32,10 @@ def test_udp_ping_pong(raiden_network, skip_if_not_udp):
 
 
 @pytest.mark.parametrize('number_of_nodes', [2])
-def test_udp_ping_pong_unreachable_node(raiden_network, skip_if_not_udp):
+def test_udp_unreachable_node(raiden_network, skip_if_not_udp):
+    """A node that does *not* answer the ping message must have its state set to
+    reachable.
+    """
     app0, app1 = raiden_network
 
     app1.raiden.transport.stop()
@@ -65,26 +69,25 @@ def test_udp_ping_pong_unreachable_node(raiden_network, skip_if_not_udp):
 @pytest.mark.parametrize('number_of_nodes', [1])
 @pytest.mark.parametrize('channels_per_node', [0])
 @pytest.mark.parametrize('number_of_tokens', [1])
-def test_raiden_service_callback_new_block(raiden_network):
-    """ Regression test for: https://github.com/raiden-network/raiden/issues/2894 """
-    app0 = raiden_network[0]
+def test_suite_survives_unhandled_exception(raiden_network, skip_if_parity):
+    """ Commit 56a617085e59fc88517e7043b629ffc9dcc0b8c4 removed code that changed
+    gevent's SYSTEM_ERROR for tests. This test aims to show that there is no regression. """
+    class UnhandledTestException(Exception):
+        pass
 
-    app0.raiden.alarm.stop()
-    target_block_num = app0.raiden.chain.block_number() + DEFAULT_NUMBER_OF_BLOCK_CONFIRMATIONS + 1
-    app0.raiden.chain.wait_until_block(target_block_num)
+    def do_fail(*args, **kwargs):
+        raise UnhandledTestException()
 
-    latest_block = app0.raiden.chain.get_block(block_identifier='latest')
-    app0.raiden._callback_new_block(latest_block=latest_block)
-    target_block_num = latest_block['number']
+    raiden_service = raiden_network[0].raiden
+    gevent.spawn(do_fail).join()
 
-    app0_state_changes = app0.raiden.wal.storage.get_statechanges_by_identifier(
-        from_identifier=0,
-        to_identifier='latest',
-    )
-
-    assert search_for_item(app0_state_changes, Block, {
-        'block_number': target_block_num - DEFAULT_NUMBER_OF_BLOCK_CONFIRMATIONS,
-    })
-    assert not search_for_item(app0_state_changes, Block, {
-        'block_number': target_block_num,
-    })
+    with pytest.raises(UnhandledTestException):
+        gevent.spawn(do_fail).get()
+    with pytest.raises(UnhandledTestException):
+        gevent.getcurrent().throw(UnhandledTestException())
+    assert hasattr(raiden_service, 'exception')
+    assert raiden_service.exception is None
+    raiden_service.alarm.register_callback(do_fail)
+    raiden_service.join(timeout=5)
+    assert raiden_service.exception is not None
+    assert isinstance(raiden_service.exception, UnhandledTestException)
